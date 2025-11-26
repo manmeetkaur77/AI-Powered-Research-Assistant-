@@ -6,41 +6,40 @@ import logging
 from dotenv import load_dotenv
 
 # --- AI & LangChain Imports ---
-# Loading necessary modules for RAG Pipeline
 from langchain_community.document_loaders import UnstructuredURLLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.chat_models import ChatOpenAI  # Updated to use Chat Model (GPT-3.5)
+from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQAWithSourcesChain
 
-# Setup logging to track errors in production
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables (API Keys) from .env file for security
 load_dotenv()
 
 class SchemeResearchTool:
     def __init__(self):
         """
-        Initializes the tool and loads API keys.
+        PURPOSE: Initialize the tool and setup authentication.
+        - Loads the OpenAI API Key securely.
+        - Initializes the vector store variable.
         """
         self.api_key = self._load_api_key()
         if self.api_key:
-            # Setting env variable so LangChain can automatically find it
             os.environ["OPENAI_API_KEY"] = self.api_key
         self.vectorstore = None
         
     def _load_api_key(self):
         """
-        Securely loads OpenAI API key. 
-        Checks environment variables first, then a local config file.
+        PURPOSE: Security best practice.
+        - Tries to get the API Key from Environment Variables (Best for Prod).
+        - Fallback: Tries to read from a local config file (Best for Local Dev).
         """
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             try:
-                # Fallback: Read from local file if env var not set
                 with open('.config') as f:
                     api_key = f.read().strip()
             except FileNotFoundError:
@@ -49,9 +48,12 @@ class SchemeResearchTool:
         return api_key
 
     def is_pdf_url(self, url):
-        """Checks if the provided URL points to a PDF file."""
+        """
+        PURPOSE: Validation Logic.
+        - Before downloading, we check if the link is actually a PDF.
+        - Uses a HEAD request (lightweight) to check the 'Content-Type' header.
+        """
         try:
-            # Using HEAD request to check content-type without downloading the whole file
             response = requests.head(url, allow_redirects=True)
             content_type = response.headers.get('content-type', '').lower()
             return 'application/pdf' in content_type or url.lower().endswith('.pdf')
@@ -60,13 +62,13 @@ class SchemeResearchTool:
 
     def download_pdf(self, url):
         """
-        ENGINEERING LOGIC:
-        PyPDFLoader cannot read online URLs directly. 
-        We download the PDF to a temporary file, process it, and then delete it.
+        PURPOSE: File Handling Logic (Crucial for PDFs).
+        - PyPDFLoader cannot read online URLs directly.
+        - LOGIC: Download the PDF -> Save to a temp file -> Return the file path.
+        - Uses 'tempfile' module to automatically handle file creation.
         """
         try:
             response = requests.get(url)
-            # Create a temp file that is automatically cleaned up later
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
                 temp_file.write(response.content)
                 return temp_file.name
@@ -75,19 +77,22 @@ class SchemeResearchTool:
             return None
 
     def process_url(self, url):
-        """Handles logic for different URL types (PDF vs Webpage)."""
+        """
+        PURPOSE: Routing Logic.
+        - Decides which loader to use based on the file type.
+        - If PDF: Use custom download logic + PyPDFLoader.
+        - If Website: Use UnstructuredURLLoader.
+        """
         try:
             logger.info(f"Processing URL: {url}")
             if self.is_pdf_url(url):
-                # Handle PDF files
                 pdf_path = self.download_pdf(url)
                 if pdf_path:
                     loader = PyPDFLoader(pdf_path)
                     docs = loader.load()
-                    os.unlink(pdf_path)  # Cleanup: Delete temp file to save memory
+                    os.unlink(pdf_path)  # CLEANUP: Delete the temp file to save memory
                     return docs
             else:
-                # Handle normal websites/blogs
                 loader = UnstructuredURLLoader(urls=[url])
                 return loader.load()
         except Exception as e:
@@ -97,7 +102,11 @@ class SchemeResearchTool:
 
     def process_urls(self, urls):
         """
-        Main function to load data and split it into chunks.
+        PURPOSE: The 'Ingestion Engine'.
+        1. Iterates through all URLs and loads data.
+        2. CHUNKING: Splits large text into smaller pieces (1500 chars).
+           - Why? Because LLMs have token limits.
+           - Overlap (300 chars) ensures context is maintained across splits.
         """
         documents = []
         for url in urls:
@@ -110,9 +119,6 @@ class SchemeResearchTool:
             st.error("No documents were successfully processed.")
             return []
 
-        # RAG CORE LOGIC: CHUNKING
-        # Splitting text into 1500-char chunks with 300-char overlap.
-        # Overlap ensures context is not lost if a sentence is cut in half.
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
             chunk_overlap=300
@@ -121,16 +127,14 @@ class SchemeResearchTool:
 
     def create_embeddings(self, docs):
         """
-        Converts text chunks into Vectors (Embeddings) and stores in FAISS.
+        PURPOSE: The 'Memory' Creation.
+        - Converts text chunks into Vectors (Numbers) using OpenAI Embeddings.
+        - Stores them in FAISS (Vector Database) for fast similarity search.
+        - Saves the index locally to disk.
         """
         try:
-            # Using OpenAI's embedding model to understand semantic meaning
             embeddings = OpenAIEmbeddings()
-            
-            # Storing vectors in FAISS (Facebook AI Similarity Search)
             self.vectorstore = FAISS.from_documents(docs, embeddings)
-            
-            # Saving index locally to avoid re-computing costs
             self.vectorstore.save_local("faiss_index")
             return True
         except Exception as e:
@@ -139,7 +143,10 @@ class SchemeResearchTool:
             return False
 
     def get_summary(self):
-        """Generates a summary using the RAG pipeline."""
+        """
+        PURPOSE: Feature - Document Summarization.
+        - Uses the RAG pipeline to generate a concise summary of all uploaded content.
+        """
         if not self.vectorstore:
             return None
             
@@ -153,10 +160,13 @@ class SchemeResearchTool:
 
     def get_answer(self, query):
         """
-        Retrieves relevant context and generates an answer using LLM.
+        PURPOSE: Core RAG Retrieval Logic.
+        1. Loads the FAISS vector store.
+        2. Initializes the LLM (ChatOpenAI) with Temperature=0 (for factual accuracy).
+        3. Creates a Retrieval Chain (Question -> Search Vector DB -> Send to LLM -> Answer).
+        4. Uses .invoke() (The modern Runnable interface).
         """
         try:
-            # Load vector store if not already loaded
             if not self.vectorstore:
                 if os.path.exists("faiss_index"):
                     self.vectorstore = FAISS.load_local("faiss_index", OpenAIEmbeddings(), allow_dangerous_deserialization=True)
@@ -164,33 +174,32 @@ class SchemeResearchTool:
                     st.error("Please process URLs first!")
                     return None
             
-            # MODEL SELECTION:
-            # Using gpt-3.5-turbo with temperature=0 for factual/precise answers (No hallucinations)
+            # Using GPT-3.5 Turbo
             llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
             
-            # CHAIN:
-            # Using RetrievalQAWithSourcesChain to return both Answer + Source URL
             chain = RetrievalQAWithSourcesChain.from_llm(
                 llm=llm,
                 retriever=self.vectorstore.as_retriever()
             )
             
-            # EXECUTION:
-            # Using .invoke() (The modern Runnable standard in LangChain)
+            # Executing the chain
             return chain.invoke({"question": query})
             
         except Exception as e:
             logger.error(f"Error getting answer: {str(e)}")
             return None
 
-# --- Streamlit UI Code ---
 def main():
+    """
+    PURPOSE: Frontend Logic (Streamlit).
+    - Handles User Interface, Button Clicks, and Displaying Results.
+    """
     st.set_page_config(page_title="Finance Research Assistant", layout="wide")
     st.title("Finance Research Assistant")
 
     tool = SchemeResearchTool()
 
-    # Sidebar for Data Ingestion
+    # Sidebar UI
     with st.sidebar:
         st.header("Input")
         input_type = st.radio("Choose input type:", ["URLs", "URL File"])
@@ -206,14 +215,13 @@ def main():
         
         process_button = st.button("Process")
 
-    # Processing Logic
+    # Processing UI
     if process_button and url_list:
         with st.spinner("Processing URLs..."):
             docs = tool.process_urls(url_list)
             if docs and tool.create_embeddings(docs):
                 st.success("Processing complete!")
                 
-                # Auto-Summary Generation
                 with st.spinner("Generating summary..."):
                     summary_result = tool.get_summary()
                     if summary_result:
@@ -222,7 +230,7 @@ def main():
                         st.subheader("Sources")
                         st.write(summary_result["sources"])
 
-    # Q&A Logic
+    # Chat UI
     st.header("Ask Questions")
     query = st.text_input("Enter your question")
 
